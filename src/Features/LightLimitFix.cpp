@@ -9,6 +9,7 @@
 #include "State.h"
 #include "Utils/ExternalEmittance.h"
 
+#include <filesystem>
 #include <numbers>
 
 #define I18N_KEY_PREFIX "feature.light_limit_fix."
@@ -410,9 +411,19 @@ void LightLimitFix::UpdateLights()
 
 	// Cache camera position from the FrameBuffer snapshot; shadowState::posAdjust can be stale in first-person
 
+	// MACDIAG round 4: when this marker file exists (create it inside the diag DLL's MO2 mod
+	// under SKSE/Plugins/CommunityShaders/), source the eye position from shadowState instead
+	// of the captured snapshot. Lets one build A/B the two eye sources.
+	static const bool diagUseShadowStateEye = [] {
+		std::error_code ec;
+		return std::filesystem::exists("Data\\SKSE\\Plugins\\CommunityShaders\\MACDIAG_shadowstate_eye", ec);
+	}();
+
 	{
 		auto eyePosition = globals::game::frameBufferCached.GetCameraPosAdjust();
 		eyePositionCached = { eyePosition.x, eyePosition.y, eyePosition.z };
+		if (diagUseShadowStateEye)
+			eyePositionCached = Util::GetEyePosition();
 	}
 
 	eastl::vector<LightData> lightsData{};
@@ -501,6 +512,34 @@ void LightLimitFix::UpdateLights()
 	auto context = globals::d3d::context;
 
 	lightCount = std::min((uint)lightsData.size(), MAX_LIGHTS);
+
+	// MACDIAG round 4: per-second dump of exactly what LLF uploads. A camera-relative
+	// light0 position has magnitude ~hundreds (near the player); an absolute one tracks
+	// eyeCached's magnitude. eyeCached vs shadowStateEye diverging wildly means the
+	// snapshot holds a non-main-view value at Prepass time.
+	{
+		static uint32_t diagTick = 0;
+		if (diagTick++ % 300 == 0) {
+			auto shadowEye = Util::GetEyePosition();
+			if (lightCount > 0) {
+				const auto& l0 = lightsData[0];
+				logger::info("[MACDIAG][LLF] mode={} lightCount={} eyeCached=({:.1f}, {:.1f}, {:.1f}) shadowStateEye=({:.1f}, {:.1f}, {:.1f}) light0: uploaded=({:.1f}, {:.1f}, {:.1f}) radius={:.1f} fade={:.3f} color=({:.2f}, {:.2f}, {:.2f}) flags={:#x}",
+					diagUseShadowStateEye ? "shadowStateEye" : "cachedEye",
+					lightCount,
+					eyePositionCached.x, eyePositionCached.y, eyePositionCached.z,
+					shadowEye.x, shadowEye.y, shadowEye.z,
+					l0.positionWS.data.x, l0.positionWS.data.y, l0.positionWS.data.z,
+					l0.radius, l0.fade,
+					l0.color.x, l0.color.y, l0.color.z,
+					l0.lightFlags.underlying());
+			} else {
+				logger::info("[MACDIAG][LLF] mode={} lightCount=0 eyeCached=({:.1f}, {:.1f}, {:.1f}) shadowStateEye=({:.1f}, {:.1f}, {:.1f})",
+					diagUseShadowStateEye ? "shadowStateEye" : "cachedEye",
+					eyePositionCached.x, eyePositionCached.y, eyePositionCached.z,
+					shadowEye.x, shadowEye.y, shadowEye.z);
+			}
+		}
+	}
 
 	D3D11_MAPPED_SUBRESOURCE mapped;
 	DX::ThrowIfFailed(context->Map(lights->resource.get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped));
