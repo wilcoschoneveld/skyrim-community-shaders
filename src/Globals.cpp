@@ -47,7 +47,9 @@
 #include "Utils/Game.h"
 #include "WeatherManager.h"
 
+#include <algorithm>
 #include <atomic>
+#include <cstring>
 #include <mutex>
 #include <unordered_set>
 
@@ -443,12 +445,10 @@ namespace globals
 		bool mapHooked = mapCommit == NO_ERROR;
 		bool unmapHooked = unmapCommit == NO_ERROR;
 
-		// Fallback for environments where Detours cannot patch the implementation code
-		// (observed under CrossOver on macOS: D3DMetal and DXMT both fail with error 87,
-		// upstream issue #1974): swap the vtable entries instead. The COM ABI guarantees
-		// calls go through these slots, so redirecting the pointer intercepts Map/Unmap
-		// regardless of what code implements them. On Windows Detours succeeds and this
-		// path never runs. func still holds the original slot value from the failed attach.
+		// Tier 2: swap the vtable entries in place. The COM ABI guarantees calls go through
+		// these slots, so redirecting the pointer intercepts Map/Unmap regardless of what
+		// code implements them. func still holds the original slot value from the failed
+		// attach. On Windows Detours succeeds and neither fallback tier runs.
 		if (!mapHooked || !unmapHooked) {
 			DWORD oldProtect{};
 			if (VirtualProtect(&vtable[14], 2 * sizeof(uintptr_t), PAGE_READWRITE, &oldProtect)) {
@@ -467,6 +467,44 @@ namespace globals
 			} else {
 				logger::error("[MACDIAG] vtable-entry swap fallback failed: VirtualProtect error {}", GetLastError());
 			}
+		}
+
+		// Tier 3: clone the vtable into our own memory, patch the clone, and repoint the
+		// object's vtable pointer at it. Wine refuses protection changes on any page of the
+		// host-mapped translation layer (D3DMetal/DXMT), code and data alike (error 87 above),
+		// so both Detours and the in-place swap are impossible there. The original vtable only
+		// needs to be readable (the CPU reads it on every virtual call) and the object header
+		// lives in ordinary process memory, so this path needs no VirtualProtect at all.
+		if (!mapHooked || !unmapHooked) {
+			MEMORY_BASIC_INFORMATION mbi{};
+			const bool queried = VirtualQuery(vtable, &mbi, sizeof(mbi)) == sizeof(mbi);
+			if (queried) {
+				logger::info("[MACDIAG] vtable region: base={:#x} size={:#x} state={:#x} protect={:#x} type={:#x}",
+					reinterpret_cast<uintptr_t>(mbi.BaseAddress), mbi.RegionSize, mbi.State, mbi.Protect, mbi.Type);
+			} else {
+				logger::info("[MACDIAG] VirtualQuery on vtable failed: error {}", GetLastError());
+			}
+
+			// ID3D11DeviceContext4 has ~147 virtual methods; copy up to 256 slots for margin,
+			// clamped to the queried region so the copy cannot run off the mapping.
+			static uintptr_t clonedVtable[256]{};
+			size_t slots = 160;
+			if (queried) {
+				auto avail = (reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize - reinterpret_cast<uintptr_t>(vtable)) / sizeof(uintptr_t);
+				slots = std::min<size_t>(std::size(clonedVtable), avail);
+			}
+			std::memcpy(clonedVtable, vtable, slots * sizeof(uintptr_t));
+			if (!mapHooked) {
+				clonedVtable[14] = reinterpret_cast<uintptr_t>(&ID3D11DeviceContext_Map::thunk);
+				mapHooked = true;
+			}
+			if (!unmapHooked) {
+				clonedVtable[15] = reinterpret_cast<uintptr_t>(&ID3D11DeviceContext_Unmap::thunk);
+				unmapHooked = true;
+			}
+			*reinterpret_cast<uintptr_t**>(a_context) = clonedVtable;
+			logger::info("[MACDIAG] vtable clone installed: {} slots copied, object vptr {:#x} -> {:#x}",
+				slots, reinterpret_cast<uintptr_t>(vtable), reinterpret_cast<uintptr_t>(clonedVtable));
 		}
 
 		diagInstallOk.store(mapHooked && unmapHooked, std::memory_order_relaxed);
