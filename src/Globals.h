@@ -260,4 +260,8 @@ namespace globals
 	 * @param a_context The D3D11 device context to hook.
 	 */
 	void InstallD3DHooks(ID3D11DeviceContext* a_context);
+	/**
+	 * @brief MACDIAG: emits a periodic [MACDIAG] log line summarizing Map/Unmap hook health. Called once per Present.
+	 */
+	void D3DHookDiagTick();
 }

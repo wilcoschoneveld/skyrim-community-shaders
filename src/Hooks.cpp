@@ -324,6 +324,8 @@ struct IDXGISwapChain_Present
 	{
 		globals::state->Reset();
 
+		globals::D3DHookDiagTick();  // MACDIAG
+
 		HRESULT retval = globals::features::hdrDisplay.HandleSwapChainPresent(
 			This,
 			SyncInterval,
