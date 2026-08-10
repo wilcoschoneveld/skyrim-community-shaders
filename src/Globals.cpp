@@ -437,8 +437,38 @@ namespace globals
 		const LONG unmapAttach = DetourAttach(reinterpret_cast<PVOID*>(&ID3D11DeviceContext_Unmap::func), reinterpret_cast<PVOID>(ID3D11DeviceContext_Unmap::thunk));
 		const LONG unmapCommit = DetourTransactionCommit();
 
-		diagInstallOk.store(mapCommit == NO_ERROR && unmapCommit == NO_ERROR, std::memory_order_relaxed);
 		logger::info("[MACDIAG] detour results: Map attach={} commit={}, Unmap attach={} commit={} (0 = NO_ERROR)",
 			mapAttach, mapCommit, unmapAttach, unmapCommit);
+
+		bool mapHooked = mapCommit == NO_ERROR;
+		bool unmapHooked = unmapCommit == NO_ERROR;
+
+		// Fallback for environments where Detours cannot patch the implementation code
+		// (observed under CrossOver on macOS: D3DMetal and DXMT both fail with error 87,
+		// upstream issue #1974): swap the vtable entries instead. The COM ABI guarantees
+		// calls go through these slots, so redirecting the pointer intercepts Map/Unmap
+		// regardless of what code implements them. On Windows Detours succeeds and this
+		// path never runs. func still holds the original slot value from the failed attach.
+		if (!mapHooked || !unmapHooked) {
+			DWORD oldProtect{};
+			if (VirtualProtect(&vtable[14], 2 * sizeof(uintptr_t), PAGE_READWRITE, &oldProtect)) {
+				if (!mapHooked) {
+					vtable[14] = reinterpret_cast<uintptr_t>(&ID3D11DeviceContext_Map::thunk);
+					mapHooked = true;
+				}
+				if (!unmapHooked) {
+					vtable[15] = reinterpret_cast<uintptr_t>(&ID3D11DeviceContext_Unmap::thunk);
+					unmapHooked = true;
+				}
+				DWORD unused{};
+				VirtualProtect(&vtable[14], 2 * sizeof(uintptr_t), oldProtect, &unused);
+				logger::info("[MACDIAG] vtable-entry swap fallback installed (Map swapped={}, Unmap swapped={})",
+					mapCommit != NO_ERROR, unmapCommit != NO_ERROR);
+			} else {
+				logger::error("[MACDIAG] vtable-entry swap fallback failed: VirtualProtect error {}", GetLastError());
+			}
+		}
+
+		diagInstallOk.store(mapHooked && unmapHooked, std::memory_order_relaxed);
 	}
 }
