@@ -27,6 +27,12 @@ void* operator new[](size_t size, size_t alignment, size_t alignmentOffset, cons
 
 using namespace std::literals;
 
+namespace Util
+{
+	// Canonical implementation in src/Utils/VTableHookFallback.cpp.
+	std::uintptr_t DetourVFuncFallback(void* a_object, std::size_t a_idx, void* a_thunk, LONG a_detourError);
+}
+
 namespace stl
 {
 	using namespace SKSE::stl;
@@ -96,19 +102,20 @@ namespace stl
 		DetourTransactionCommit();
 	}
 
-	namespace detail
-	{
-		inline constexpr std::size_t max_cloned_vfunc_slots = 256;
-
-		std::uintptr_t detour_vfunc_tiered(void* a_object, std::size_t a_idx, void* a_thunk);
-	}
-
 	template <std::size_t idx, class T>
 	void detour_vfunc(void* target)
 	{
-		static_assert(idx < detail::max_cloned_vfunc_slots);
-		// Detours first, then vtable fallbacks for Wine/CrossOver; see src/Hooks.cpp.
-		T::func = detail::detour_vfunc_tiered(target, idx, reinterpret_cast<PVOID>(T::thunk));
+		auto vtable = *reinterpret_cast<uintptr_t**>(target);
+		T::func = vtable[idx];
+		DetourTransactionBegin();
+		DetourUpdateThread(GetCurrentThread());
+		LONG result = DetourAttach(reinterpret_cast<PVOID*>(&T::func), reinterpret_cast<PVOID>(T::thunk));
+		if (result == NO_ERROR)
+			result = DetourTransactionCommit();
+		else
+			DetourTransactionAbort();
+		if (result != NO_ERROR)
+			T::func = Util::DetourVFuncFallback(target, idx, reinterpret_cast<PVOID>(T::thunk), result);
 	}
 }
 
