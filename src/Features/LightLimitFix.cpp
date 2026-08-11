@@ -9,6 +9,7 @@
 #include "State.h"
 #include "Utils/ExternalEmittance.h"
 
+#include <filesystem>
 #include <numbers>
 
 #define I18N_KEY_PREFIX "feature.light_limit_fix."
@@ -27,6 +28,29 @@ void LightLimitFix::DrawSettings()
 	auto shaderCache = globals::shaderCache;
 
 	ImGui::Checkbox(T(TKEY("enable_particle_lights"), "Enable Particle Lights"), &settings.EnableParticleLights);
+
+	ImGui::Spacing();
+
+	// MACDIAG: A/B toggles for #1974 before/after screenshots. Both off = fully
+	// fixed; both on = authentic pre-fix behavior. No i18n: diag-only, stripped
+	// before the upstream PR.
+	ImGui::SeparatorText("MACDIAG A/B (#1974)");
+	{
+		static bool macdiagDeadCapture = false;
+		if (ImGui::Checkbox("Bug 1: simulate dead per-frame capture", &macdiagDeadCapture))
+			globals::game::macdiagSimulateDeadCapture.store(macdiagDeadCapture, std::memory_order_relaxed);
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::Text("%s", "Zeroes the frameBufferCached snapshot each frame, reproducing the dead\n"
+							  "Map-hook capture: LLF loses the camera-relative adjust (interiors dark)\n"
+							  "and Screen-Space Shadows banding returns. Takes effect next frame.");
+		}
+		ImGui::Checkbox("Bug 2: use stock culling bytecode", &macdiagUseStockCullingCS);
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::Text("%s", "Dispatches the culling CS compiled with MACDIAG_STOCK_GROUPSHARED, whose\n"
+							  "preprocessed source (and DXBC) is identical to pre-fix stock. On D3DMetal\n"
+							  "this bytecode mistranslates: zero clusters, interiors dark.");
+		}
+	}
 
 	ImGui::Spacing();
 
@@ -98,6 +122,10 @@ void LightLimitFix::SetupResources()
 		std::vector<std::pair<const char*, const char*>> clusterDefines;
 		clusterBuildingCS = (ID3D11ComputeShader*)Util::CompileShader(L"Data\\Shaders\\LightLimitFix\\ClusterBuildingCS.hlsl", clusterDefines, "cs_5_0");
 		clusterCullingCS = (ID3D11ComputeShader*)Util::CompileShader(L"Data\\Shaders\\LightLimitFix\\ClusterCullingCS.hlsl", clusterDefines, "cs_5_0");
+
+		// MACDIAG: stock-bytecode variant for A/B screenshots
+		std::vector<std::pair<const char*, const char*>> stockDefines{ { "MACDIAG_STOCK_GROUPSHARED", "" } };
+		clusterCullingCSStock = (ID3D11ComputeShader*)Util::CompileShader(L"Data\\Shaders\\LightLimitFix\\ClusterCullingCS.hlsl", stockDefines, "cs_5_0");
 
 		lightBuildingCB = new ConstantBuffer(ConstantBufferDesc<LightBuildingCB>());
 		lightCullingCB = new ConstantBuffer(ConstantBufferDesc<LightCullingCB>());
@@ -396,9 +424,17 @@ void LightLimitFix::ClearShaderCache()
 		clusterCullingCS->Release();
 		clusterCullingCS = nullptr;
 	}
+	if (clusterCullingCSStock) {
+		clusterCullingCSStock->Release();
+		clusterCullingCSStock = nullptr;
+	}
 	std::vector<std::pair<const char*, const char*>> clusterDefines;
 	clusterBuildingCS = (ID3D11ComputeShader*)Util::CompileShader(L"Data\\Shaders\\LightLimitFix\\ClusterBuildingCS.hlsl", clusterDefines, "cs_5_0");
 	clusterCullingCS = (ID3D11ComputeShader*)Util::CompileShader(L"Data\\Shaders\\LightLimitFix\\ClusterCullingCS.hlsl", clusterDefines, "cs_5_0");
+
+	// MACDIAG: stock-bytecode variant for A/B screenshots
+	std::vector<std::pair<const char*, const char*>> stockDefines{ { "MACDIAG_STOCK_GROUPSHARED", "" } };
+	clusterCullingCSStock = (ID3D11ComputeShader*)Util::CompileShader(L"Data\\Shaders\\LightLimitFix\\ClusterCullingCS.hlsl", stockDefines, "cs_5_0");
 }
 
 void LightLimitFix::UpdateLights()
@@ -410,9 +446,19 @@ void LightLimitFix::UpdateLights()
 
 	// Cache camera position from the FrameBuffer snapshot; shadowState::posAdjust can be stale in first-person
 
+	// MACDIAG round 4: when this marker file exists (create it inside the diag DLL's MO2 mod
+	// under SKSE/Plugins/CommunityShaders/), source the eye position from shadowState instead
+	// of the captured snapshot. Lets one build A/B the two eye sources.
+	static const bool diagUseShadowStateEye = [] {
+		std::error_code ec;
+		return std::filesystem::exists("Data\\SKSE\\Plugins\\CommunityShaders\\MACDIAG_shadowstate_eye", ec);
+	}();
+
 	{
 		auto eyePosition = globals::game::frameBufferCached.GetCameraPosAdjust();
 		eyePositionCached = { eyePosition.x, eyePosition.y, eyePosition.z };
+		if (diagUseShadowStateEye)
+			eyePositionCached = Util::GetEyePosition();
 	}
 
 	eastl::vector<LightData> lightsData{};
@@ -502,6 +548,34 @@ void LightLimitFix::UpdateLights()
 
 	lightCount = std::min((uint)lightsData.size(), MAX_LIGHTS);
 
+	// MACDIAG round 4: per-second dump of exactly what LLF uploads. A camera-relative
+	// light0 position has magnitude ~hundreds (near the player); an absolute one tracks
+	// eyeCached's magnitude. eyeCached vs shadowStateEye diverging wildly means the
+	// snapshot holds a non-main-view value at Prepass time.
+	{
+		static uint32_t diagTick = 0;
+		if (diagTick++ % 300 == 0) {
+			auto shadowEye = Util::GetEyePosition();
+			if (lightCount > 0) {
+				const auto& l0 = lightsData[0];
+				logger::info("[MACDIAG][LLF] mode={} lightCount={} eyeCached=({:.1f}, {:.1f}, {:.1f}) shadowStateEye=({:.1f}, {:.1f}, {:.1f}) light0: uploaded=({:.1f}, {:.1f}, {:.1f}) radius={:.1f} fade={:.3f} color=({:.2f}, {:.2f}, {:.2f}) flags={:#x}",
+					diagUseShadowStateEye ? "shadowStateEye" : "cachedEye",
+					lightCount,
+					eyePositionCached.x, eyePositionCached.y, eyePositionCached.z,
+					shadowEye.x, shadowEye.y, shadowEye.z,
+					l0.positionWS.data.x, l0.positionWS.data.y, l0.positionWS.data.z,
+					l0.radius, l0.fade,
+					l0.color.x, l0.color.y, l0.color.z,
+					l0.lightFlags.underlying());
+			} else {
+				logger::info("[MACDIAG][LLF] mode={} lightCount=0 eyeCached=({:.1f}, {:.1f}, {:.1f}) shadowStateEye=({:.1f}, {:.1f}, {:.1f})",
+					diagUseShadowStateEye ? "shadowStateEye" : "cachedEye",
+					eyePositionCached.x, eyePositionCached.y, eyePositionCached.z,
+					shadowEye.x, shadowEye.y, shadowEye.z);
+			}
+		}
+	}
+
 	D3D11_MAPPED_SUBRESOURCE mapped;
 	DX::ThrowIfFailed(context->Map(lights->resource.get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped));
 	size_t bytes = sizeof(LightData) * lightCount;
@@ -565,7 +639,8 @@ void LightLimitFix::UpdateStructure()
 		ID3D11UnorderedAccessView* uavs[] = { lightIndexCounter->uav.get(), lightIndexList->uav.get(), lightGrid->uav.get() };
 		context->CSSetUnorderedAccessViews(0, ARRAYSIZE(uavs), uavs, nullptr);
 
-		context->CSSetShader(clusterCullingCS, nullptr, 0);
+		// MACDIAG: A/B between fixed and stock-bytecode culling for screenshots
+		context->CSSetShader((macdiagUseStockCullingCS && clusterCullingCSStock) ? clusterCullingCSStock : clusterCullingCS, nullptr, 0);
 		globals::profiler->BeginPass("LightLimitFix::ClusterCull");
 		context->Dispatch((clusterSize[0] + 15) / 16, (clusterSize[1] + 15) / 16, (clusterSize[2] + 3) / 4);
 		globals::profiler->EndPass();

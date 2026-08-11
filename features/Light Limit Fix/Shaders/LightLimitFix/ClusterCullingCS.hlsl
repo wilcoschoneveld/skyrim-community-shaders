@@ -18,7 +18,13 @@ RWStructuredBuffer<uint> lightIndexCounter : register(u0);
 RWStructuredBuffer<uint> lightIndexList : register(u1);
 RWStructuredBuffer<LightGrid> lightGrid : register(u2);
 
+// MACDIAG: sharedLights is dead code (filled, never read). It is removed by
+// default because D3DMetal mistranslates the stock bytecode (upstream #1974,
+// bug 2). MACDIAG_STOCK_GROUPSHARED re-adds it so the preprocessed source (and
+// DXBC) is byte-identical to pre-fix stock, for in-menu A/B screenshots.
+#if defined(MACDIAG_STOCK_GROUPSHARED)
 groupshared Light sharedLights[GROUP_SIZE];
+#endif
 
 bool LightIntersectsCluster(float3 position, float radiusSquared, ClusterAABB cluster)
 {
@@ -42,6 +48,7 @@ bool LightIntersectsCluster(float3 position, float radiusSquared, ClusterAABB cl
 
 	ClusterAABB cluster = clusters[clusterIndex];
 
+#if defined(MACDIAG_STOCK_GROUPSHARED)
 	if (groupIndex < LightCount) {
 		uint lightIndex = groupIndex;
 		Light light = lights[lightIndex];
@@ -49,6 +56,7 @@ bool LightIntersectsCluster(float3 position, float radiusSquared, ClusterAABB cl
 	}
 
 	GroupMemoryBarrierWithGroupSync();
+#endif
 
 	for (uint i = 0; i < LightCount; i++) {
 		Light light = lights[i];
@@ -66,7 +74,9 @@ bool LightIntersectsCluster(float3 position, float radiusSquared, ClusterAABB cl
 		}
 	}
 
+#if defined(MACDIAG_STOCK_GROUPSHARED)
 	GroupMemoryBarrierWithGroupSync();
+#endif
 
 	uint offset = 0;
 	InterlockedAdd(lightIndexCounter[0], visibleLightCount, offset);

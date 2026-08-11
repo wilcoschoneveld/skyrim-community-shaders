@@ -225,6 +225,11 @@ namespace globals
 
 		extern D3D11_MAPPED_SUBRESOURCE* mappedFrameBuffer;
 		extern FrameBufferCache frameBufferCached;
+
+		// MACDIAG: A/B toggle for #1974 screenshots. When set, CacheFramebuffer zeroes
+		// the snapshot instead of copying, reproducing the pre-fix dead-capture state
+		// (LLF eye position, SSS matrix, etc.). Driven from LightLimitFix::DrawSettings.
+		extern std::atomic<bool> macdiagSimulateDeadCapture;
 	}
 
 	namespace rtti
@@ -260,4 +265,8 @@ namespace globals
 	 * @param a_context The D3D11 device context to hook.
 	 */
 	void InstallD3DHooks(ID3D11DeviceContext* a_context);
+	/**
+	 * @brief MACDIAG: emits a periodic [MACDIAG] log line summarizing Map/Unmap hook health. Called once per Present.
+	 */
+	void D3DHookDiagTick();
 }

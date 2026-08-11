@@ -47,6 +47,12 @@
 #include "Utils/Game.h"
 #include "WeatherManager.h"
 
+#include <algorithm>
+#include <atomic>
+#include <cstring>
+#include <mutex>
+#include <unordered_set>
+
 namespace globals
 {
 	namespace d3d
@@ -139,6 +145,7 @@ namespace globals
 
 		D3D11_MAPPED_SUBRESOURCE* mappedFrameBuffer = nullptr;
 		FrameBufferCache frameBufferCached{};
+		std::atomic<bool> macdiagSimulateDeadCapture{ false };
 	}
 
 	static void RefreshTES()
@@ -247,6 +254,83 @@ namespace globals
 			shaderCache->StopCompilation();
 	}
 
+	// MACDIAG: temporary instrumentation for the Wine (CrossOver / D3DMetal / DXMT) frameBuffer
+	// capture investigation, see upstream issue #1974. Logging is strictly additive; the original
+	// hook behavior is unchanged. Remove before merging any fix.
+	namespace
+	{
+		std::atomic<uint64_t> diagMapCalls{ 0 };
+		std::atomic<uint64_t> diagMapMatches{ 0 };
+		std::atomic<uint64_t> diagMapMatchesBadHr{ 0 };
+		std::atomic<uint64_t> diagUnmapCalls{ 0 };
+		std::atomic<uint64_t> diagUnmapMatches{ 0 };
+		std::atomic<uint64_t> diagCaptures{ 0 };
+		std::atomic<bool> diagInstallOk{ false };
+		std::atomic<bool> diagInventoryFull{ false };
+
+		std::mutex diagInventoryMutex;
+		std::unordered_set<ID3D11Resource*> diagSeenDiscardResources;
+
+		ID3D11Buffer* DiagPerFrameBuffer()
+		{
+			auto ptr = globals::game::perFrame.get();
+			return ptr ? *ptr : nullptr;
+		}
+
+		// Logs each unique WRITE_DISCARD-mapped resource once (up to 64), with buffer sizes, so the
+		// real per-frame constant buffer (ByteWidth closest to sizeof(FrameBuffer)) can be identified
+		// even if it is not pointer-identical to the game's perFrame global.
+		void DiagLogDiscardResource(ID3D11Resource* pResource)
+		{
+			if (diagInventoryFull.load(std::memory_order_relaxed))
+				return;
+			std::scoped_lock lock(diagInventoryMutex);
+			if (diagSeenDiscardResources.size() >= 64) {
+				diagInventoryFull.store(true, std::memory_order_relaxed);
+				return;
+			}
+			if (!diagSeenDiscardResources.insert(pResource).second)
+				return;
+			Microsoft::WRL::ComPtr<ID3D11Buffer> buffer;
+			if (SUCCEEDED(pResource->QueryInterface(IID_PPV_ARGS(&buffer)))) {
+				D3D11_BUFFER_DESC desc{};
+				buffer->GetDesc(&desc);
+				logger::info("[MACDIAG] discard-map buffer #{}: ptr={:#x} ByteWidth={} BindFlags={:#x} (sizeof(FrameBuffer)={} perFrame={:#x})",
+					diagSeenDiscardResources.size(),
+					reinterpret_cast<uintptr_t>(pResource),
+					desc.ByteWidth,
+					desc.BindFlags,
+					sizeof(FrameBuffer),
+					reinterpret_cast<uintptr_t>(DiagPerFrameBuffer()));
+			} else {
+				logger::info("[MACDIAG] discard-map non-buffer resource #{}: ptr={:#x}",
+					diagSeenDiscardResources.size(),
+					reinterpret_cast<uintptr_t>(pResource));
+			}
+		}
+	}
+
+	void D3DHookDiagTick()
+	{
+		static std::atomic<uint64_t> presentCount{ 0 };
+		auto n = presentCount.fetch_add(1, std::memory_order_relaxed) + 1;
+		if (n != 60 && n % 600 != 0)
+			return;
+		auto& pos = game::frameBufferCached.GetCameraPosAdjust();
+		logger::info("[MACDIAG] summary @present {}: installOk={} mapCalls={} mapMatches={} mapMatchesBadHr={} unmapCalls={} unmapMatches={} captures={} perFrame={:#x} mappedFrameBuffer={:#x} cachedPosAdjust=({:.1f}, {:.1f}, {:.1f})",
+			n,
+			diagInstallOk.load(std::memory_order_relaxed),
+			diagMapCalls.load(std::memory_order_relaxed),
+			diagMapMatches.load(std::memory_order_relaxed),
+			diagMapMatchesBadHr.load(std::memory_order_relaxed),
+			diagUnmapCalls.load(std::memory_order_relaxed),
+			diagUnmapMatches.load(std::memory_order_relaxed),
+			diagCaptures.load(std::memory_order_relaxed),
+			reinterpret_cast<uintptr_t>(DiagPerFrameBuffer()),
+			reinterpret_cast<uintptr_t>(game::mappedFrameBuffer),
+			pos.x, pos.y, pos.z);
+	}
+
 	/**
  * @brief Caches the current frame buffer data and clears the mapped pointer.
  *
@@ -255,9 +339,22 @@ namespace globals
 	void CacheFramebuffer()
 	{
 		using namespace game;
+		// MACDIAG: A/B for screenshots - zeroed snapshot == authentic pre-fix state
+		if (macdiagSimulateDeadCapture.load(std::memory_order_relaxed)) {
+			frameBufferCached.data = {};
+			mappedFrameBuffer = nullptr;
+			return;
+		}
 		auto frameBuffer = (FrameBuffer*)mappedFrameBuffer->pData;
 		frameBufferCached.data = *frameBuffer;
 		mappedFrameBuffer = nullptr;
+
+		// MACDIAG
+		auto n = diagCaptures.fetch_add(1, std::memory_order_relaxed) + 1;
+		if (n <= 3) {
+			auto& pos = frameBufferCached.GetCameraPosAdjust();
+			logger::info("[MACDIAG] capture #{}: CameraPosAdjust=({:.1f}, {:.1f}, {:.1f})", n, pos.x, pos.y, pos.z);
+		}
 	}
 
 	/**
@@ -272,6 +369,29 @@ namespace globals
 		static HRESULT thunk(ID3D11DeviceContext* This, ID3D11Resource* pResource, UINT Subresource, D3D11_MAP MapType, UINT MapFlags, D3D11_MAPPED_SUBRESOURCE* pMappedResource)
 		{
 			HRESULT hr = func(This, pResource, Subresource, MapType, MapFlags, pMappedResource);
+
+			// MACDIAG
+			diagMapCalls.fetch_add(1, std::memory_order_relaxed);
+			if (MapType == D3D11_MAP_WRITE_DISCARD)
+				DiagLogDiscardResource(pResource);
+			if (DiagPerFrameBuffer() == pResource) {
+				if (hr == S_OK) {
+					auto n = diagMapMatches.fetch_add(1, std::memory_order_relaxed) + 1;
+					if (n <= 3)
+						logger::info("[MACDIAG] Map matched perFrame #{}: MapType={} hr={:#x} pData={:#x}",
+							n,
+							static_cast<int>(MapType),
+							static_cast<uint32_t>(hr),
+							reinterpret_cast<uintptr_t>(pMappedResource ? pMappedResource->pData : nullptr));
+				} else {
+					auto n = diagMapMatchesBadHr.fetch_add(1, std::memory_order_relaxed) + 1;
+					if (n <= 3)
+						logger::info("[MACDIAG] Map matched perFrame but hr != S_OK: hr={:#x} MapType={}",
+							static_cast<uint32_t>(hr),
+							static_cast<int>(MapType));
+				}
+			}
+
 			if (hr == S_OK) {
 				if (*globals::game::perFrame.get() == pResource)
 					globals::game::mappedFrameBuffer = pMappedResource;
@@ -290,6 +410,11 @@ namespace globals
 	{
 		static void thunk(ID3D11DeviceContext* This, ID3D11Resource* pResource, UINT Subresource)
 		{
+			// MACDIAG
+			diagUnmapCalls.fetch_add(1, std::memory_order_relaxed);
+			if (DiagPerFrameBuffer() == pResource)
+				diagUnmapMatches.fetch_add(1, std::memory_order_relaxed);
+
 			if (*globals::game::perFrame.get() == pResource && globals::game::mappedFrameBuffer) {
 				CacheFramebuffer();
 			}
@@ -300,7 +425,95 @@ namespace globals
 
 	void InstallD3DHooks(ID3D11DeviceContext* a_context)
 	{
-		stl::detour_vfunc<14, ID3D11DeviceContext_Map>(a_context);
-		stl::detour_vfunc<15, ID3D11DeviceContext_Unmap>(a_context);
+		// MACDIAG: expanded from stl::detour_vfunc so the Detours attach/commit results are
+		// logged instead of discarded. Hook mechanics are otherwise identical.
+		auto vtable = *reinterpret_cast<uintptr_t**>(a_context);
+		logger::info("[MACDIAG] InstallD3DHooks: context={:#x} vtable={:#x} slot14(Map)={:#x} slot15(Unmap)={:#x}",
+			reinterpret_cast<uintptr_t>(a_context),
+			reinterpret_cast<uintptr_t>(vtable),
+			vtable[14],
+			vtable[15]);
+
+		ID3D11DeviceContext_Map::func = vtable[14];
+		DetourTransactionBegin();
+		DetourUpdateThread(GetCurrentThread());
+		const LONG mapAttach = DetourAttach(reinterpret_cast<PVOID*>(&ID3D11DeviceContext_Map::func), reinterpret_cast<PVOID>(ID3D11DeviceContext_Map::thunk));
+		const LONG mapCommit = DetourTransactionCommit();
+
+		ID3D11DeviceContext_Unmap::func = vtable[15];
+		DetourTransactionBegin();
+		DetourUpdateThread(GetCurrentThread());
+		const LONG unmapAttach = DetourAttach(reinterpret_cast<PVOID*>(&ID3D11DeviceContext_Unmap::func), reinterpret_cast<PVOID>(ID3D11DeviceContext_Unmap::thunk));
+		const LONG unmapCommit = DetourTransactionCommit();
+
+		logger::info("[MACDIAG] detour results: Map attach={} commit={}, Unmap attach={} commit={} (0 = NO_ERROR)",
+			mapAttach, mapCommit, unmapAttach, unmapCommit);
+
+		bool mapHooked = mapCommit == NO_ERROR;
+		bool unmapHooked = unmapCommit == NO_ERROR;
+
+		// Tier 2: swap the vtable entries in place. The COM ABI guarantees calls go through
+		// these slots, so redirecting the pointer intercepts Map/Unmap regardless of what
+		// code implements them. func still holds the original slot value from the failed
+		// attach. On Windows Detours succeeds and neither fallback tier runs.
+		if (!mapHooked || !unmapHooked) {
+			DWORD oldProtect{};
+			if (VirtualProtect(&vtable[14], 2 * sizeof(uintptr_t), PAGE_READWRITE, &oldProtect)) {
+				if (!mapHooked) {
+					vtable[14] = reinterpret_cast<uintptr_t>(&ID3D11DeviceContext_Map::thunk);
+					mapHooked = true;
+				}
+				if (!unmapHooked) {
+					vtable[15] = reinterpret_cast<uintptr_t>(&ID3D11DeviceContext_Unmap::thunk);
+					unmapHooked = true;
+				}
+				DWORD unused{};
+				VirtualProtect(&vtable[14], 2 * sizeof(uintptr_t), oldProtect, &unused);
+				logger::info("[MACDIAG] vtable-entry swap fallback installed (Map swapped={}, Unmap swapped={})",
+					mapCommit != NO_ERROR, unmapCommit != NO_ERROR);
+			} else {
+				logger::error("[MACDIAG] vtable-entry swap fallback failed: VirtualProtect error {}", GetLastError());
+			}
+		}
+
+		// Tier 3: clone the vtable into our own memory, patch the clone, and repoint the
+		// object's vtable pointer at it. Wine refuses protection changes on any page of the
+		// host-mapped translation layer (D3DMetal/DXMT), code and data alike (error 87 above),
+		// so both Detours and the in-place swap are impossible there. The original vtable only
+		// needs to be readable (the CPU reads it on every virtual call) and the object header
+		// lives in ordinary process memory, so this path needs no VirtualProtect at all.
+		if (!mapHooked || !unmapHooked) {
+			MEMORY_BASIC_INFORMATION mbi{};
+			const bool queried = VirtualQuery(vtable, &mbi, sizeof(mbi)) == sizeof(mbi);
+			if (queried) {
+				logger::info("[MACDIAG] vtable region: base={:#x} size={:#x} state={:#x} protect={:#x} type={:#x}",
+					reinterpret_cast<uintptr_t>(mbi.BaseAddress), mbi.RegionSize, mbi.State, mbi.Protect, mbi.Type);
+			} else {
+				logger::info("[MACDIAG] VirtualQuery on vtable failed: error {}", GetLastError());
+			}
+
+			// ID3D11DeviceContext4 has ~147 virtual methods; copy up to 256 slots for margin,
+			// clamped to the queried region so the copy cannot run off the mapping.
+			static uintptr_t clonedVtable[256]{};
+			size_t slots = 160;
+			if (queried) {
+				auto avail = (reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize - reinterpret_cast<uintptr_t>(vtable)) / sizeof(uintptr_t);
+				slots = std::min<size_t>(std::size(clonedVtable), avail);
+			}
+			std::memcpy(clonedVtable, vtable, slots * sizeof(uintptr_t));
+			if (!mapHooked) {
+				clonedVtable[14] = reinterpret_cast<uintptr_t>(&ID3D11DeviceContext_Map::thunk);
+				mapHooked = true;
+			}
+			if (!unmapHooked) {
+				clonedVtable[15] = reinterpret_cast<uintptr_t>(&ID3D11DeviceContext_Unmap::thunk);
+				unmapHooked = true;
+			}
+			*reinterpret_cast<uintptr_t**>(a_context) = clonedVtable;
+			logger::info("[MACDIAG] vtable clone installed: {} slots copied, object vptr {:#x} -> {:#x}",
+				slots, reinterpret_cast<uintptr_t>(vtable), reinterpret_cast<uintptr_t>(clonedVtable));
+		}
+
+		diagInstallOk.store(mapHooked && unmapHooked, std::memory_order_relaxed);
 	}
 }
