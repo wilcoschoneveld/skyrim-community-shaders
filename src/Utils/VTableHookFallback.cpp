@@ -39,6 +39,10 @@ namespace Util
 {
 	std::uintptr_t DetourVFuncFallback(void* a_object, std::size_t a_idx, void* a_thunk, LONG a_detourError)
 	{
+		std::scoped_lock lock(clonedVTableMutex);
+
+		// Read under the lock: a concurrent hook may have just repointed this object at a
+		// clone, and the clone check below must see the current vtable pointer.
 		auto vtable = *static_cast<std::uintptr_t**>(a_object);
 		const auto original = vtable[a_idx];
 
@@ -46,8 +50,6 @@ namespace Util
 			logger::warn("[Hooks] virtual slot {} exceeds the supported clone size {}; left unhooked (Detours error {})", a_idx, max_cloned_vfunc_slots, a_detourError);
 			return original;
 		}
-
-		std::scoped_lock lock(clonedVTableMutex);
 
 		// An earlier hook may already have repointed this object at a clone; cloning again
 		// would discard it. The slot value read above came from the clone, so returning it
@@ -76,13 +78,10 @@ namespace Util
 		const DWORD protectResult = GetLastError();
 
 		// Clone the vtable, patch the copy, repoint the object; needs no protection change.
-		std::size_t slots = 160;
-		if (queried && mbi.State == MEM_COMMIT)
-			slots = (reinterpret_cast<std::uintptr_t>(mbi.BaseAddress) + mbi.RegionSize - reinterpret_cast<std::uintptr_t>(vtable)) / sizeof(std::uintptr_t);
-		slots = std::clamp<std::size_t>(slots, a_idx + 1, max_cloned_vfunc_slots);
-
+		// Copy the full capacity so every readable source slot keeps resolving through
+		// the clone.
 		auto clone = std::make_unique<std::uintptr_t[]>(max_cloned_vfunc_slots);
-		if (CopyReadableSlots(clone.get(), vtable, slots) <= a_idx) {
+		if (CopyReadableSlots(clone.get(), vtable, max_cloned_vfunc_slots) <= a_idx) {
 			logger::warn("[Hooks] virtual slot {} could not be hooked: Detours failed (error {}), the vtable page refused VirtualProtect (error {}), and the vtable was unreadable at that slot", a_idx, a_detourError, protectResult);
 			return original;
 		}
