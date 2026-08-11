@@ -20,6 +20,116 @@
 #include "Features/Upscaling.h"
 #include "Features/VolumetricLighting.h"
 
+#include <algorithm>
+#include <cstring>
+#include <memory>
+#include <mutex>
+#include <unordered_map>
+
+namespace stl::detail
+{
+	namespace
+	{
+		// Objects whose vtable pointer was repointed at a plugin-owned clone by the fallback
+		// below. Every slot hooked on the same object must patch the same clone, and each
+		// clone must stay valid for as long as its object might dispatch through it - which
+		// includes process teardown after this DLL's static destructors have run - so the map
+		// is intentionally leaked and entries are never erased.
+		std::mutex clonedVTableMutex;
+		auto& clonedVTables = *new std::unordered_map<void*, std::unique_ptr<std::uintptr_t[]>>();
+
+		// A vtable in memory Wine reports as MEM_FREE cannot be pre-validated with
+		// VirtualQuery, so fault containment is the only safe way to bound the copy. Copies
+		// page by page so a fault loses nothing already copied; returns the slots copied.
+		std::size_t CopyReadableSlots(std::uintptr_t* a_dst, const std::uintptr_t* a_src, std::size_t a_count) noexcept
+		{
+			std::size_t copied = 0;
+			__try {
+				while (copied < a_count) {
+					const auto cursor = reinterpret_cast<std::uintptr_t>(a_src + copied);
+					const auto pageEnd = (cursor & ~static_cast<std::uintptr_t>(0xFFF)) + 0x1000;
+					const auto chunk = std::min(a_count - copied, (pageEnd - cursor) / sizeof(std::uintptr_t));
+					std::memcpy(a_dst + copied, a_src + copied, chunk * sizeof(std::uintptr_t));
+					copied += chunk;
+				}
+			} __except (EXCEPTION_EXECUTE_HANDLER) {
+			}
+			return copied;
+		}
+	}
+
+	std::uintptr_t detour_vfunc_slot(void* a_object, std::size_t a_idx, void* a_thunk)
+	{
+		auto vtable = *static_cast<std::uintptr_t**>(a_object);
+		const auto original = vtable[a_idx];
+
+		auto detoured = reinterpret_cast<PVOID>(original);
+		DetourTransactionBegin();
+		DetourUpdateThread(GetCurrentThread());
+		LONG detourResult = DetourAttach(&detoured, a_thunk);
+		if (detourResult == NO_ERROR)
+			detourResult = DetourTransactionCommit();
+		else
+			DetourTransactionAbort();
+		if (detourResult == NO_ERROR)
+			return reinterpret_cast<std::uintptr_t>(detoured);
+
+		// Detours patches the implementation's code, which needs VirtualProtect on it. Wine
+		// (CrossOver) maps D3D translation layers (D3DMetal, DXMT) as host memory it does not
+		// track: VirtualQuery reports those modules as MEM_FREE and every protection-changing
+		// call on them fails with ERROR_INVALID_PARAMETER, code and vtable pages alike, so no
+		// VirtualProtect-based mechanism can hook them. Redirect the dispatch instead: the COM
+		// ABI guarantees calls go through the vtable slot, whatever code implements it.
+		std::scoped_lock lock(clonedVTableMutex);
+
+		if (auto it = clonedVTables.find(a_object); it != clonedVTables.end() && it->second.get() == vtable) {
+			it->second[a_idx] = reinterpret_cast<std::uintptr_t>(a_thunk);
+			logger::warn("[Hooks] Detours could not patch virtual slot {} (error {}); patched the object's existing vtable clone", a_idx, detourResult);
+			return original;
+		}
+
+		MEMORY_BASIC_INFORMATION mbi{};
+		const bool queried = VirtualQuery(vtable, &mbi, sizeof(mbi)) == sizeof(mbi);
+
+		// Swap the slot in place, keeping execute rights if the page has them.
+		constexpr DWORD executeProtects = PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+		const DWORD writableProtect = (queried && (mbi.Protect & executeProtects) != 0) ? PAGE_EXECUTE_READWRITE : PAGE_READWRITE;
+		DWORD previousProtect = 0;
+		if (VirtualProtect(&vtable[a_idx], sizeof(std::uintptr_t), writableProtect, &previousProtect)) {
+			vtable[a_idx] = reinterpret_cast<std::uintptr_t>(a_thunk);
+			DWORD restoredProtect = 0;
+			if (!VirtualProtect(&vtable[a_idx], sizeof(std::uintptr_t), previousProtect, &restoredProtect))
+				logger::warn("[Hooks] could not restore protection {:#x} on virtual slot {} (error {})", previousProtect, a_idx, GetLastError());
+			logger::warn("[Hooks] Detours could not patch virtual slot {} (error {}); swapped the vtable slot in place", a_idx, detourResult);
+			return original;
+		}
+		const DWORD protectResult = GetLastError();
+
+		// The vtable page cannot be written either. Clone the table into plugin memory, patch
+		// the clone, and repoint the object's vtable pointer at it: the original table only
+		// needs to stay readable and the pointer lives in an ordinary allocation, so this path
+		// needs no protection change at all. The copy is sized for the largest interface hooked
+		// this way (ID3D11DeviceContext4, ~147 virtual methods), clamped to the vtable's memory
+		// region where that is known, and fault-contained where it is not (Wine reports the
+		// whole mapping MEM_FREE), so it cannot run off the mapping.
+		std::size_t slots = 160;
+		if (queried && mbi.State == MEM_COMMIT)
+			slots = (reinterpret_cast<std::uintptr_t>(mbi.BaseAddress) + mbi.RegionSize - reinterpret_cast<std::uintptr_t>(vtable)) / sizeof(std::uintptr_t);
+		slots = std::clamp<std::size_t>(slots, a_idx + 1, max_cloned_vfunc_slots);
+
+		auto clone = std::make_unique<std::uintptr_t[]>(max_cloned_vfunc_slots);
+		if (CopyReadableSlots(clone.get(), vtable, slots) <= a_idx) {
+			logger::warn("[Hooks] virtual slot {} could not be hooked: Detours failed (error {}), the vtable page refused VirtualProtect (error {}), and the vtable was unreadable at that slot", a_idx, detourResult, protectResult);
+			return original;
+		}
+		clone[a_idx] = reinterpret_cast<std::uintptr_t>(a_thunk);
+		*static_cast<std::uintptr_t**>(a_object) = clone.get();
+		clonedVTables[a_object] = std::move(clone);
+		logger::warn("[Hooks] Detours could not patch virtual slot {} (error {}) and the vtable page refused VirtualProtect (error {}); repointed the object at a patched vtable clone", a_idx, detourResult, protectResult);
+		return original;
+	}
+}
+
 std::unordered_map<void*, std::pair<std::unique_ptr<uint8_t[]>, size_t>> ShaderBytecodeMap;
 
 void RegisterShaderBytecode(void* Shader, const void* Bytecode, size_t BytecodeLength)

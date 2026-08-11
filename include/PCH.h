@@ -96,15 +96,22 @@ namespace stl
 		DetourTransactionCommit();
 	}
 
+	namespace detail
+	{
+		inline constexpr std::size_t max_cloned_vfunc_slots = 256;
+
+		std::uintptr_t detour_vfunc_slot(void* a_object, std::size_t a_idx, void* a_thunk);
+	}
+
+	// Prefers a Detours patch of the slot's implementation; falls back to redirecting the
+	// vtable slot itself (in place, or via a per-object vtable clone) in environments where
+	// code patching is impossible, e.g. Wine's host-mapped D3D translation layers. The
+	// fallbacks are a no-op whenever Detours succeeds. Implementation in src/Hooks.cpp.
 	template <std::size_t idx, class T>
 	void detour_vfunc(void* target)
 	{
-		auto vtable = *reinterpret_cast<uintptr_t**>(target);
-		T::func = vtable[idx];
-		DetourTransactionBegin();
-		DetourUpdateThread(GetCurrentThread());
-		DetourAttach(reinterpret_cast<PVOID*>(&T::func), reinterpret_cast<PVOID>(T::thunk));
-		DetourTransactionCommit();
+		static_assert(idx < detail::max_cloned_vfunc_slots);
+		T::func = detail::detour_vfunc_slot(target, idx, reinterpret_cast<PVOID>(T::thunk));
 	}
 }
 
