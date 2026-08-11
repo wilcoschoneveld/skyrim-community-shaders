@@ -30,7 +30,7 @@ using namespace std::literals;
 // Forward declaration
 namespace Util
 {
-	std::uintptr_t DetourVFuncFallback(void* a_object, std::size_t a_idx, void* a_thunk, LONG a_detourError);
+	std::uintptr_t VTableHookFallback(void* a_object, std::size_t a_idx, void* a_thunk, LONG a_detourError);
 }
 
 namespace stl
@@ -115,7 +115,7 @@ namespace stl
 		else
 			DetourTransactionAbort();
 		if (result != NO_ERROR)
-			T::func = Util::DetourVFuncFallback(target, idx, reinterpret_cast<PVOID>(T::thunk), result);
+			T::func = Util::VTableHookFallback(target, idx, reinterpret_cast<PVOID>(T::thunk), result);
 	}
 }
 

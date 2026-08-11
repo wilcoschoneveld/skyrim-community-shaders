@@ -8,7 +8,7 @@
 
 namespace
 {
-	inline constexpr std::size_t max_cloned_vfunc_slots = 256;
+	inline constexpr std::size_t max_cloned_vtable_slots = 256;
 
 	// Objects repointed at a plugin-owned vtable clone. Later hooks on the same object
 	// must patch the same clone, and clones must stay dispatchable after this DLL's
@@ -37,7 +37,7 @@ namespace
 
 namespace Util
 {
-	std::uintptr_t DetourVFuncFallback(void* a_object, std::size_t a_idx, void* a_thunk, LONG a_detourError)
+	std::uintptr_t VTableHookFallback(void* a_object, std::size_t a_idx, void* a_thunk, LONG a_detourError)
 	{
 		std::scoped_lock lock(clonedVTableMutex);
 
@@ -46,8 +46,8 @@ namespace Util
 		auto vtable = *static_cast<std::uintptr_t**>(a_object);
 		const auto original = vtable[a_idx];
 
-		if (a_idx >= max_cloned_vfunc_slots) {
-			logger::warn("[Hooks] virtual slot {} exceeds the supported clone size {}; left unhooked (Detours error {})", a_idx, max_cloned_vfunc_slots, a_detourError);
+		if (a_idx >= max_cloned_vtable_slots) {
+			logger::warn("[Hooks] virtual slot {} exceeds the supported clone size {}; left unhooked (Detours error {})", a_idx, max_cloned_vtable_slots, a_detourError);
 			return original;
 		}
 
@@ -80,8 +80,8 @@ namespace Util
 		// Clone the vtable, patch the copy, repoint the object; needs no protection change.
 		// Copy the full capacity so every readable source slot keeps resolving through
 		// the clone.
-		auto clone = std::make_unique<std::uintptr_t[]>(max_cloned_vfunc_slots);
-		if (CopyReadableSlots(clone.get(), vtable, max_cloned_vfunc_slots) <= a_idx) {
+		auto clone = std::make_unique<std::uintptr_t[]>(max_cloned_vtable_slots);
+		if (CopyReadableSlots(clone.get(), vtable, max_cloned_vtable_slots) <= a_idx) {
 			logger::warn("[Hooks] virtual slot {} could not be hooked: Detours failed (error {}), the vtable page refused VirtualProtect (error {}), and the vtable was unreadable at that slot", a_idx, a_detourError, protectResult);
 			return original;
 		}

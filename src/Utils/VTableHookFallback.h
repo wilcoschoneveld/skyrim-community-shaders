@@ -14,5 +14,5 @@ namespace Util
 	 *
 	 * @return The original function pointer the hook must call through.
 	 */
-	std::uintptr_t DetourVFuncFallback(void* a_object, std::size_t a_idx, void* a_thunk, LONG a_detourError);
+	std::uintptr_t VTableHookFallback(void* a_object, std::size_t a_idx, void* a_thunk, LONG a_detourError);
 }
