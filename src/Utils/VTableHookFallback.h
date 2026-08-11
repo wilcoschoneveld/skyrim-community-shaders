@@ -10,7 +10,7 @@ namespace Util
 	 *
 	 * Needed under Wine/CrossOver, where the D3D11 translation layer lives in host-mapped
 	 * memory whose pages reject every protection change, so only the clone can carry the
-	 * hook. Never called on Windows, where Detours succeeds.
+	 * hook.
 	 *
 	 * @return The original function pointer the hook must call through.
 	 */

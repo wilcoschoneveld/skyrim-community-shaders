@@ -107,13 +107,15 @@ namespace stl
 	{
 		auto vtable = *reinterpret_cast<uintptr_t**>(target);
 		T::func = vtable[idx];
-		DetourTransactionBegin();
-		DetourUpdateThread(GetCurrentThread());
-		LONG result = DetourAttach(reinterpret_cast<PVOID*>(&T::func), reinterpret_cast<PVOID>(T::thunk));
-		if (result == NO_ERROR)
-			result = DetourTransactionCommit();
-		else
-			DetourTransactionAbort();
+		LONG result = DetourTransactionBegin();
+		if (result == NO_ERROR) {
+			DetourUpdateThread(GetCurrentThread());
+			result = DetourAttach(reinterpret_cast<PVOID*>(&T::func), reinterpret_cast<PVOID>(T::thunk));
+			if (result == NO_ERROR)
+				result = DetourTransactionCommit();
+			else
+				DetourTransactionAbort();
+		}
 		if (result != NO_ERROR)
 			T::func = Util::VTableHookFallback(target, idx, reinterpret_cast<PVOID>(T::thunk), result);
 	}
