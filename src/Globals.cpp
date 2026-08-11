@@ -145,6 +145,7 @@ namespace globals
 
 		D3D11_MAPPED_SUBRESOURCE* mappedFrameBuffer = nullptr;
 		FrameBufferCache frameBufferCached{};
+		std::atomic<bool> macdiagSimulateDeadCapture{ false };
 	}
 
 	static void RefreshTES()
@@ -338,6 +339,12 @@ namespace globals
 	void CacheFramebuffer()
 	{
 		using namespace game;
+		// MACDIAG: A/B for screenshots - zeroed snapshot == authentic pre-fix state
+		if (macdiagSimulateDeadCapture.load(std::memory_order_relaxed)) {
+			frameBufferCached.data = {};
+			mappedFrameBuffer = nullptr;
+			return;
+		}
 		auto frameBuffer = (FrameBuffer*)mappedFrameBuffer->pData;
 		frameBufferCached.data = *frameBuffer;
 		mappedFrameBuffer = nullptr;

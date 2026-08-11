@@ -31,6 +31,29 @@ void LightLimitFix::DrawSettings()
 
 	ImGui::Spacing();
 
+	// MACDIAG: A/B toggles for #1974 before/after screenshots. Both off = fully
+	// fixed; both on = authentic pre-fix behavior. No i18n: diag-only, stripped
+	// before the upstream PR.
+	ImGui::SeparatorText("MACDIAG A/B (#1974)");
+	{
+		static bool macdiagDeadCapture = false;
+		if (ImGui::Checkbox("Bug 1: simulate dead per-frame capture", &macdiagDeadCapture))
+			globals::game::macdiagSimulateDeadCapture.store(macdiagDeadCapture, std::memory_order_relaxed);
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::Text("%s", "Zeroes the frameBufferCached snapshot each frame, reproducing the dead\n"
+							  "Map-hook capture: LLF loses the camera-relative adjust (interiors dark)\n"
+							  "and Screen-Space Shadows banding returns. Takes effect next frame.");
+		}
+		ImGui::Checkbox("Bug 2: use stock culling bytecode", &macdiagUseStockCullingCS);
+		if (auto _tt = Util::HoverTooltipWrapper()) {
+			ImGui::Text("%s", "Dispatches the culling CS compiled with MACDIAG_STOCK_GROUPSHARED, whose\n"
+							  "preprocessed source (and DXBC) is identical to pre-fix stock. On D3DMetal\n"
+							  "this bytecode mistranslates: zero clusters, interiors dark.");
+		}
+	}
+
+	ImGui::Spacing();
+
 	if (ImGui::TreeNodeEx(T(TKEY("statistics"), "Statistics"), ImGuiTreeNodeFlags_DefaultOpen)) {
 		ImGui::Text(std::format("Clustered Light Count : {}", lightCount).c_str());
 
@@ -99,6 +122,10 @@ void LightLimitFix::SetupResources()
 		std::vector<std::pair<const char*, const char*>> clusterDefines;
 		clusterBuildingCS = (ID3D11ComputeShader*)Util::CompileShader(L"Data\\Shaders\\LightLimitFix\\ClusterBuildingCS.hlsl", clusterDefines, "cs_5_0");
 		clusterCullingCS = (ID3D11ComputeShader*)Util::CompileShader(L"Data\\Shaders\\LightLimitFix\\ClusterCullingCS.hlsl", clusterDefines, "cs_5_0");
+
+		// MACDIAG: stock-bytecode variant for A/B screenshots
+		std::vector<std::pair<const char*, const char*>> stockDefines{ { "MACDIAG_STOCK_GROUPSHARED", "" } };
+		clusterCullingCSStock = (ID3D11ComputeShader*)Util::CompileShader(L"Data\\Shaders\\LightLimitFix\\ClusterCullingCS.hlsl", stockDefines, "cs_5_0");
 
 		lightBuildingCB = new ConstantBuffer(ConstantBufferDesc<LightBuildingCB>());
 		lightCullingCB = new ConstantBuffer(ConstantBufferDesc<LightCullingCB>());
@@ -397,9 +424,17 @@ void LightLimitFix::ClearShaderCache()
 		clusterCullingCS->Release();
 		clusterCullingCS = nullptr;
 	}
+	if (clusterCullingCSStock) {
+		clusterCullingCSStock->Release();
+		clusterCullingCSStock = nullptr;
+	}
 	std::vector<std::pair<const char*, const char*>> clusterDefines;
 	clusterBuildingCS = (ID3D11ComputeShader*)Util::CompileShader(L"Data\\Shaders\\LightLimitFix\\ClusterBuildingCS.hlsl", clusterDefines, "cs_5_0");
 	clusterCullingCS = (ID3D11ComputeShader*)Util::CompileShader(L"Data\\Shaders\\LightLimitFix\\ClusterCullingCS.hlsl", clusterDefines, "cs_5_0");
+
+	// MACDIAG: stock-bytecode variant for A/B screenshots
+	std::vector<std::pair<const char*, const char*>> stockDefines{ { "MACDIAG_STOCK_GROUPSHARED", "" } };
+	clusterCullingCSStock = (ID3D11ComputeShader*)Util::CompileShader(L"Data\\Shaders\\LightLimitFix\\ClusterCullingCS.hlsl", stockDefines, "cs_5_0");
 }
 
 void LightLimitFix::UpdateLights()
@@ -604,7 +639,8 @@ void LightLimitFix::UpdateStructure()
 		ID3D11UnorderedAccessView* uavs[] = { lightIndexCounter->uav.get(), lightIndexList->uav.get(), lightGrid->uav.get() };
 		context->CSSetUnorderedAccessViews(0, ARRAYSIZE(uavs), uavs, nullptr);
 
-		context->CSSetShader(clusterCullingCS, nullptr, 0);
+		// MACDIAG: A/B between fixed and stock-bytecode culling for screenshots
+		context->CSSetShader((macdiagUseStockCullingCS && clusterCullingCSStock) ? clusterCullingCSStock : clusterCullingCS, nullptr, 0);
 		globals::profiler->BeginPass("LightLimitFix::ClusterCull");
 		context->Dispatch((clusterSize[0] + 15) / 16, (clusterSize[1] + 15) / 16, (clusterSize[2] + 3) / 4);
 		globals::profiler->EndPass();

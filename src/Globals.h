@@ -225,6 +225,11 @@ namespace globals
 
 		extern D3D11_MAPPED_SUBRESOURCE* mappedFrameBuffer;
 		extern FrameBufferCache frameBufferCached;
+
+		// MACDIAG: A/B toggle for #1974 screenshots. When set, CacheFramebuffer zeroes
+		// the snapshot instead of copying, reproducing the pre-fix dead-capture state
+		// (LLF eye position, SSS matrix, etc.). Driven from LightLimitFix::DrawSettings.
+		extern std::atomic<bool> macdiagSimulateDeadCapture;
 	}
 
 	namespace rtti

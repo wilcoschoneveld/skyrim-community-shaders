@@ -163,6 +163,13 @@ public:
 	ID3D11ComputeShader* clusterBuildingCS = nullptr;
 	ID3D11ComputeShader* clusterCullingCS = nullptr;
 
+	// MACDIAG: A/B toggles for #1974 screenshots. clusterCullingCSStock is the same
+	// HLSL compiled with MACDIAG_STOCK_GROUPSHARED, which re-adds the dead groupshared
+	// block so the preprocessed source (and thus the DXBC) is byte-identical to the
+	// pre-fix stock shader that D3DMetal mistranslates.
+	ID3D11ComputeShader* clusterCullingCSStock = nullptr;
+	bool macdiagUseStockCullingCS = false;
+
 	ConstantBuffer* lightBuildingCB = nullptr;
 	ConstantBuffer* lightCullingCB = nullptr;
 
