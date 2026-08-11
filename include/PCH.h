@@ -27,9 +27,9 @@ void* operator new[](size_t size, size_t alignment, size_t alignmentOffset, cons
 
 using namespace std::literals;
 
+// Forward declaration
 namespace Util
 {
-	// Canonical implementation in src/Utils/VTableHookFallback.cpp.
 	std::uintptr_t DetourVFuncFallback(void* a_object, std::size_t a_idx, void* a_thunk, LONG a_detourError);
 }
 
